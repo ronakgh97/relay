@@ -2,6 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dashmap::DashMap;
 use relay::START_TIME;
+use relay::debug;
+use relay::log::LOG_LEVEL;
+use relay::log::Level;
+use relay::{error, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -32,6 +36,10 @@ enum CliArgs {
         /// Maximum number of concurrent connections
         #[arg(long, default_value = "1024")]
         max_connections: usize,
+
+        /// Log level
+        #[arg(long, default_value = "info")]
+        log_level: Level,
     },
     /// Show server protocol information
     Protocol {},
@@ -56,7 +64,9 @@ async fn main() -> Result<()> {
         CliArgs::Start {
             server_addr,
             max_connections,
+            log_level,
         } => {
+            LOG_LEVEL.set(log_level).expect("Failed to set log level");
             run_server(server_addr, max_connections).await?;
         }
         CliArgs::Protocol { .. } => {
@@ -84,7 +94,10 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
     START_TIME
         .set(chrono::Local::now())
         .expect("Failed to set start time");
-    println!("Relay server listening on {}", addr);
+    info!(
+        "Relay server started on {} with max connections: {}",
+        addr, max_connections
+    );
 
     let current_connections = Arc::new(AtomicUsize::new(0));
     let shutdown = Arc::new(Notify::new());
@@ -93,7 +106,7 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
         // Wait for either a new connection or a shutdown signal
         tokio::select! {
             _ = ctrl_c_handler() => {
-                println!("Shutdown signal received");
+                info!("Shutdown signal received, stopping server...");
                 shutdown.notify_waiters();
                 break;
             }
@@ -102,22 +115,22 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
                     Ok((socket, addr)) => {
                         if current_connections.fetch_add(1, Ordering::AcqRel) >= max_connections {
                             current_connections.fetch_sub(1, Ordering::AcqRel);
-                            println!("Maximum number of connections reached, rejecting {}", addr);
+                            warn!("Maximum number of connections reached, rejecting {}", addr);
                             drop(socket);
                             continue;
                         }
-                        println!("Accepted client from {}", addr);
+                        debug!("Accepted connections from {}", addr);
                         let active_connections = Arc::clone(&current_connections);
                         let shutdown_signal = Arc::clone(&shutdown);
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(socket, shutdown_signal).await {
-                                println!("Error handling client (ip: {}): {:?}", addr, e);
+                                error!("Error handling client (ip: {}): {:?}", addr, e);
                             };
                             active_connections.fetch_sub(1, Ordering::AcqRel);
                         });
                     }
                     Err(e) => {
-                        println!("Error accepting connection: {:?}", e);
+                        error!("Error accepting connection from ({}): {:?}", addr, e);
                     }
                 }
             }
@@ -125,7 +138,7 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
     }
 
     drop(listener);
-    println!(
+    info!(
         "Waiting for {} active connections to complete...",
         current_connections.load(Ordering::Acquire)
     );
@@ -133,7 +146,7 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
     while current_connections.load(Ordering::Acquire) != 0 {
         tokio::task::yield_now().await;
     }
-    println!("Server shutdown complete.");
+    info!("Server shutdown complete.");
 
     Ok(())
 }
@@ -154,14 +167,14 @@ pub async fn handle_client(mut stream: TcpStream, shutdown_signal: Arc<Notify>) 
     if let Some((_, waiting_client)) = SESSION_MAP.remove(&pairing_key) {
         let mut waiting_stream = waiting_client.stream;
         waiting_client.notify.notify_one();
-        println!(
-            "Paired client: {} <--> {}",
+        info!(
+            "Clients paired: {} <--> {}",
             stream.peer_addr()?,
             waiting_stream.peer_addr()?
         );
         let (a, b) =
             copy_bidirectional_with_sizes(&mut stream, &mut waiting_stream, AB, BA).await?;
-        println!(
+        info!(
             "Bytes transferred: ({}) {} <--> ({}) {}",
             stream.peer_addr()?,
             a,
