@@ -1,3 +1,5 @@
+pub mod log;
+
 pub static START_TIME: std::sync::OnceLock<chrono::DateTime<chrono::Local>> =
     std::sync::OnceLock::new();
 

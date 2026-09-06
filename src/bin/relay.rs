@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dashmap::DashMap;
+use relay::START_TIME;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -14,7 +15,7 @@ use tokio::time::sleep;
     name = "relay",
     version = "1.0.0",
     about = "High-performance Duplex relay server over TCP",
-    long_about = "None"
+    long_about = "High-performance Duplex relay server over TCP"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -43,8 +44,9 @@ struct WaitingClient {
     notify: Arc<Notify>,
 }
 
+/// Global session map to store waiting clients by their pairing key.
 static SESSION_MAP: LazyLock<DashMap<[u8; 32], WaitingClient>> =
-    LazyLock::new(|| DashMap::with_capacity(1024));
+    LazyLock::new(|| DashMap::with_capacity(1 >> 20));
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,7 +60,6 @@ async fn main() -> Result<()> {
             run_server(server_addr, max_connections).await?;
         }
         CliArgs::Protocol { .. } => {
-            println!("SERVER PROTOCOL:");
             println!("1. Client connects to the relay server and sends a 32-byte pairing key.");
             println!(
                 "2. The first client to send a pairing key will be stored in the session map."
@@ -75,58 +76,91 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
 pub async fn run_server(server_addr: String, max_connections: usize) -> Result<()> {
     let listener = TcpListener::bind(&server_addr).await?;
     let addr = listener.local_addr()?;
 
+    START_TIME
+        .set(chrono::Local::now())
+        .expect("Failed to set start time");
     println!("Relay server listening on {}", addr);
 
-    let cuurent_connections = Arc::new(AtomicUsize::new(0));
-    loop {
-        if cuurent_connections.fetch_add(1, Ordering::Relaxed) >= max_connections {
-            cuurent_connections.fetch_sub(1, Ordering::Relaxed);
-            println!("Maximum number of connections reached");
-            sleep(Duration::from_secs(3)).await;
-            continue;
-        }
+    let current_connections = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(Notify::new());
 
-        match listener.accept().await {
-            Ok((socket, addr)) => {
-                println!("Accepted client from {}", addr);
-                let active_connections = Arc::clone(&cuurent_connections);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(socket).await {
-                        println!("Error handling client (ip: {}): {:?}", addr, e);
-                    };
-                    active_connections.fetch_sub(1, Ordering::Relaxed);
-                });
+    loop {
+        // Wait for either a new connection or a shutdown signal
+        tokio::select! {
+            _ = ctrl_c_handler() => {
+                println!("Shutdown signal received, stop accepting new connections");
+                shutdown.notify_waiters();
+                break;
             }
-            Err(e) => {
-                println!("Error accepting connection: {:?}", e);
-                cuurent_connections.fetch_sub(1, Ordering::Relaxed);
+            res = listener.accept() => {
+                match res {
+                    Ok((socket, addr)) => {
+                        if current_connections.fetch_add(1, Ordering::AcqRel) >= max_connections {
+                            current_connections.fetch_sub(1, Ordering::AcqRel);
+                            println!("Maximum number of connections reached, rejecting {}", addr);
+                            drop(socket);
+                            continue;
+                        }
+                        println!("Accepted client from {}", addr);
+                        let active_connections = Arc::clone(&current_connections);
+                        let shutdown_signal = Arc::clone(&shutdown);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(socket, shutdown_signal).await {
+                                println!("Error handling client (ip: {}): {:?}", addr, e);
+                            };
+                            active_connections.fetch_sub(1, Ordering::AcqRel);
+                        });
+                    }
+                    Err(e) => {
+                        println!("Error accepting connection: {:?}", e);
+                    }
+                }
             }
         }
     }
+
+    drop(listener);
+    println!(
+        "Waiting for {} active connections to drain...",
+        current_connections.load(Ordering::Acquire)
+    );
+    // Wait for all active connections to finish before shutting down (returning from main)
+    while current_connections.load(Ordering::Acquire) != 0 {
+        tokio::task::yield_now().await;
+    }
+    println!("All connections drained, shutdown complete");
+
+    Ok(())
 }
 
+/// Buffer size for A -> B
+const AB: usize = 2 >> 20;
+/// Buffer size for B -> A
+const BA: usize = 2 >> 20;
+
 #[inline(always)]
-pub async fn handle_client(mut stream: TcpStream) -> Result<()> {
+pub async fn handle_client(mut stream: TcpStream, shutdown_signal: Arc<Notify>) -> Result<()> {
     stream.set_nodelay(true)?;
 
     let mut pairing_key = [0u8; 32];
     stream.read_exact(&mut pairing_key).await?;
 
-    // second arriver, take waiter's socket and start piping.
-    if let Some((_, waiting)) = SESSION_MAP.remove(&pairing_key) {
-        let mut waiting_stream = waiting.stream;
-        waiting.notify.notify_one();
+    // second arriver, take waiter's socket and start piping
+    if let Some((_, waiting_client)) = SESSION_MAP.remove(&pairing_key) {
+        let mut waiting_stream = waiting_client.stream;
+        waiting_client.notify.notify_one();
         println!(
             "Paired client: {} <--> {}",
             stream.peer_addr()?,
             waiting_stream.peer_addr()?
         );
         let (a, b) =
-            copy_bidirectional_with_sizes(&mut stream, &mut waiting_stream, 16384, 16384).await?;
+            copy_bidirectional_with_sizes(&mut stream, &mut waiting_stream, AB, BA).await?;
         println!(
             "Bytes transferred: ({}) {} <--> ({}) {}",
             stream.peer_addr()?,
@@ -137,18 +171,22 @@ pub async fn handle_client(mut stream: TcpStream) -> Result<()> {
         return Ok(());
     }
 
-    // first arriver, store socket, park until paired or timeout.
-    let notify = Arc::new(Notify::new());
+    // first arriver, store socket, park until paired or timeout or shutdown
+    let waiter_signal = Arc::new(Notify::new());
     let waiting_client = WaitingClient {
         stream,
-        notify: Arc::clone(&notify),
+        notify: Arc::clone(&waiter_signal),
     };
     SESSION_MAP.insert(pairing_key, waiting_client);
 
-    // wait for second arriver (notify the waiter) or timeout, then remove from map.
+    // wait for second arriver (notify the waiter), timeout, or shutdown
+    // shutdown disconnects waiter and remove entry (drops parked stream) and exit
     tokio::select! {
-        _ = notify.notified() => {}
+        _ = waiter_signal.notified() => {}
         _ = sleep(Duration::from_secs(60)) => {
+            SESSION_MAP.remove(&pairing_key);
+        }
+        _ = shutdown_signal.notified() => {
             SESSION_MAP.remove(&pairing_key);
         }
     }
@@ -156,6 +194,7 @@ pub async fn handle_client(mut stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// Cross-platform Ctrl+C handler that also handles SIGTERM on Unix systems.
 async fn ctrl_c_handler() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
