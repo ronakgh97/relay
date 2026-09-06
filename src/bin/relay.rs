@@ -46,7 +46,7 @@ struct WaitingClient {
 
 /// Global session map to store waiting clients by their pairing key.
 static SESSION_MAP: LazyLock<DashMap<[u8; 32], WaitingClient>> =
-    LazyLock::new(|| DashMap::with_capacity(1 >> 20));
+    LazyLock::new(|| DashMap::with_capacity(1 << 20));
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -93,7 +93,7 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
         // Wait for either a new connection or a shutdown signal
         tokio::select! {
             _ = ctrl_c_handler() => {
-                println!("Shutdown signal received, stop accepting new connections");
+                println!("Shutdown signal received");
                 shutdown.notify_waiters();
                 break;
             }
@@ -126,22 +126,22 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
 
     drop(listener);
     println!(
-        "Waiting for {} active connections to drain...",
+        "Waiting for {} active connections to complete...",
         current_connections.load(Ordering::Acquire)
     );
     // Wait for all active connections to finish before shutting down (returning from main)
     while current_connections.load(Ordering::Acquire) != 0 {
         tokio::task::yield_now().await;
     }
-    println!("All connections drained, shutdown complete");
+    println!("Server shutdown complete.");
 
     Ok(())
 }
 
 /// Buffer size for A -> B
-const AB: usize = 2 >> 20;
+const AB: usize = 2 << 20;
 /// Buffer size for B -> A
-const BA: usize = 2 >> 20;
+const BA: usize = 2 << 20;
 
 #[inline(always)]
 pub async fn handle_client(mut stream: TcpStream, shutdown_signal: Arc<Notify>) -> Result<()> {
