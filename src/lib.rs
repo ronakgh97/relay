@@ -1,4 +1,5 @@
 pub mod log;
+pub mod rate_limit;
 
 pub static START_TIME: std::sync::OnceLock<chrono::DateTime<chrono::Local>> =
     std::sync::OnceLock::new();

@@ -2,10 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dashmap::DashMap;
 use relay::START_TIME;
-use relay::debug;
 use relay::log::LOG_LEVEL;
 use relay::log::Level;
-use relay::{error, info, warn};
+use relay::rate_limit::IpRateLimiter;
+use relay::{debug, error, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -17,7 +17,7 @@ use tokio::time::sleep;
 #[derive(Parser)]
 #[command(
     name = "relay",
-    version = "1.0.0",
+    version = "v1.0.0",
     about = "High-performance Duplex relay server over TCP",
     long_about = "High-performance Duplex relay server over TCP"
 )]
@@ -36,6 +36,14 @@ enum CliArgs {
         /// Maximum number of concurrent connections
         #[arg(long, default_value = "1024")]
         max_connections: usize,
+
+        /// Maximum number of new connections per IP per rate
+        #[arg(long, default_value = "60")]
+        max_requests_per_ip: u32,
+
+        /// Rate window in seconds for per-IP limiting
+        #[arg(long, default_value = "60")]
+        rate_window_secs: u64,
 
         /// Log level
         #[arg(long, default_value = "info")]
@@ -64,10 +72,18 @@ async fn main() -> Result<()> {
         CliArgs::Start {
             server_addr,
             max_connections,
+            max_requests_per_ip,
+            rate_window_secs,
             log_level,
         } => {
             LOG_LEVEL.set(log_level).expect("Failed to set log level");
-            run_server(server_addr, max_connections).await?;
+            run_server(
+                server_addr,
+                max_connections,
+                max_requests_per_ip,
+                rate_window_secs,
+            )
+            .await?;
         }
         CliArgs::Protocol { .. } => {
             println!("1. Client connects to the relay server and sends a 32-byte pairing key.");
@@ -87,7 +103,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-pub async fn run_server(server_addr: String, max_connections: usize) -> Result<()> {
+pub async fn run_server(
+    server_addr: String,
+    max_connections: usize,
+    max_requests_per_ip: u32,
+    rate_window_secs: u64,
+) -> Result<()> {
     let listener = TcpListener::bind(&server_addr).await?;
     let addr = listener.local_addr()?;
 
@@ -95,12 +116,16 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
         .set(chrono::Local::now())
         .expect("Failed to set start time");
     info!(
-        "Relay server started on {} with max connections: {}",
-        addr, max_connections
+        "Relay server started on {} with max connections: {}, rate limit: {}/{}s per IP",
+        addr, max_connections, max_requests_per_ip, rate_window_secs
     );
 
     let current_connections = Arc::new(AtomicUsize::new(0));
     let shutdown = Arc::new(Notify::new());
+    let mut rate_limiter = IpRateLimiter::init(
+        max_requests_per_ip,
+        Duration::from_secs(rate_window_secs.max(1)),
+    );
 
     loop {
         // Wait for either a new connection or a shutdown signal
@@ -113,6 +138,12 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
             res = listener.accept() => {
                 match res {
                     Ok((socket, addr)) => {
+                        let client_ip = addr.ip();
+                        if !rate_limiter.check(client_ip) {
+                            warn!("Rate limit exceeded for {}, rejecting", client_ip);
+                            drop(socket);
+                            continue;
+                        }
                         if current_connections.fetch_add(1, Ordering::AcqRel) >= max_connections {
                             current_connections.fetch_sub(1, Ordering::AcqRel);
                             warn!("Maximum number of connections reached, rejecting {}", addr);
@@ -142,7 +173,7 @@ pub async fn run_server(server_addr: String, max_connections: usize) -> Result<(
         "Waiting for {} active connections to complete...",
         current_connections.load(Ordering::Acquire)
     );
-    // Wait for all active connections to finish before shutting down (returning from main)
+    // wait for all active connections to finish before shutting down (returning from main)
     while current_connections.load(Ordering::Acquire) != 0 {
         tokio::task::yield_now().await;
     }
