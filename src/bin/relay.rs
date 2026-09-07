@@ -6,7 +6,7 @@ use relay::log::LOG_LEVEL;
 use relay::log::Level;
 use relay::rate_limit::IpRateLimiter;
 use relay::{debug, error, info, warn};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, copy_bidirectional_with_sizes};
@@ -35,15 +35,11 @@ enum CliArgs {
 
         /// Maximum number of concurrent connections
         #[arg(long, default_value = "1024")]
-        max_connections: usize,
+        max_connections: u32,
 
-        /// Maximum number of new connections per IP per rate
+        /// Maximum number of new connections per IP per min (0 = unlimited)
         #[arg(long, default_value = "60")]
-        max_requests_per_ip: u32,
-
-        /// Rate window in seconds for per-IP limiting
-        #[arg(long, default_value = "60")]
-        rate_window_secs: u64,
+        max_requests: u32,
 
         /// Log level
         #[arg(long, default_value = "info")]
@@ -72,18 +68,11 @@ async fn main() -> Result<()> {
         CliArgs::Start {
             server_addr,
             max_connections,
-            max_requests_per_ip,
-            rate_window_secs,
+            max_requests,
             log_level,
         } => {
             LOG_LEVEL.set(log_level).expect("Failed to set log level");
-            run_server(
-                server_addr,
-                max_connections,
-                max_requests_per_ip,
-                rate_window_secs,
-            )
-            .await?;
+            run_server(server_addr, max_connections, max_requests).await?;
         }
         CliArgs::Protocol { .. } => {
             println!("1. Client connects to the relay server and sends a 32-byte pairing key.");
@@ -105,9 +94,8 @@ async fn main() -> Result<()> {
 
 pub async fn run_server(
     server_addr: String,
-    max_connections: usize,
+    max_connections: u32,
     max_requests_per_ip: u32,
-    rate_window_secs: u64,
 ) -> Result<()> {
     let listener = TcpListener::bind(&server_addr).await?;
     let addr = listener.local_addr()?;
@@ -116,16 +104,13 @@ pub async fn run_server(
         .set(chrono::Local::now())
         .expect("Failed to set start time");
     info!(
-        "Relay server started on {} with max connections: {}, rate limit: {}/{}s per IP",
-        addr, max_connections, max_requests_per_ip, rate_window_secs
+        "Relay server started on {} with max connections: {}, rate limit: {}/min per IP",
+        addr, max_connections, max_requests_per_ip
     );
 
-    let current_connections = Arc::new(AtomicUsize::new(0));
+    let current_connections = Arc::new(AtomicU32::new(0));
     let shutdown = Arc::new(Notify::new());
-    let mut rate_limiter = IpRateLimiter::init(
-        max_requests_per_ip,
-        Duration::from_secs(rate_window_secs.max(1)),
-    );
+    let mut rate_limiter = IpRateLimiter::init(max_requests_per_ip);
 
     loop {
         // Wait for either a new connection or a shutdown signal
